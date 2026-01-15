@@ -1,17 +1,31 @@
 # ============================================================
-# Forest SAR: Leader-Follower + ORCA + LIDAR (STABLE / FIXED)
+# Forest Search-and-Rescue (SAR): Leader–Follower Swarm
+# with ORCA-based Collision Avoidance and LIDAR Sensing
 #
-# Key stability fixes applied (logic-level):
-#   1) ORCA max_speed matched to executable speed (exec_max_speed)
-#   2) No "teleport" integration: XY target integrates with dt (not lookahead)
-#   3) LIDAR avoidance applied ONCE per step (no double-injection)
-#   4) Formation smoothly softens/shrinks near obstacles (dmin-based weight)
-#   5) When braking near obstacles, followers stop being "pulled" into leader
+# Overview:
+#   - A leader–follower coordination strategy for multi-drone
+#     search-and-rescue in cluttered environments.
+#   - Followers track dynamically defined formation goals
+#     relative to a designated leader.
+#
+# Safety and Motion Handling:
+#   - ORCA is used for inter-drone collision avoidance.
+#   - LIDAR-based sensing influences local motion to account
+#     for nearby obstacles.
+#   - Motion commands are integrated over time to ensure
+#     physically consistent execution.
+#
+# Formation Behavior:
+#   - The follower formation adapts smoothly in the presence
+#     of obstacles while remaining coupled to the leader.
+#   - Interaction between formation control and safety
+#     mechanisms is handled continuously.
 #
 # Run:
-#   python leader-follower-fixed.py --gui False --fast True --safe_visuals True --num_drones 5
-#   python leader-follower-fixed.py --gui True  --fast True --safe_visuals True --num_drones 5
+#   python leader-follower.py --gui False --fast True --safe_visuals True --num_drones 5
+#   python leader-follower.py --gui True  --fast True --safe_visuals True --num_drones 5
 # ============================================================
+
 
 import time
 import argparse

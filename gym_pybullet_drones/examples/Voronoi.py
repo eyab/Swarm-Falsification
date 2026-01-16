@@ -1264,10 +1264,12 @@ def run(
                 new_xy = drone_xy[j].copy()
                 z_cmd = max(z_cmd, SEARCH_ALTITUDE + RECOVER_Z_BOOST)
 
-            # NOTE: kept exactly as in your code (no logic change)
-            Z_MIN = 1.5
+            ## Altitude limits consistent with stated SAR flight envelope
+            Z_MIN = DRONE_Z   # 0.6 m (initial takeoff height)
             Z_MAX = 3.0
             z_cmd = float(np.clip(z_cmd, Z_MIN, Z_MAX))
+
+
 
             targets[j, :] = np.array([new_xy[0], new_xy[1], z_cmd], dtype=float)
 

@@ -788,6 +788,7 @@ def orca_step_2d(positions, velocities, pref_velocities, agent_radius, neighbor_
                     u = (np.dot(rel_vel, direction) - np.dot(inv_time_h * rel_pos, direction)) * direction - rel_vel
             else:
                 inv_time_step = 1.0 / 0.05
+                #inv_time_step = 1.0 / max(dt, 1e-6)
                 w = rel_vel - inv_time_step * rel_pos
                 w_len = _norm(w)
                 unit_w = w / max(w_len, 1e-12)

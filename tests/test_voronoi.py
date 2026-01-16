@@ -21,6 +21,12 @@ def test_poly_area_centroid():
     # Centroid of (0,0), (2,0), (0,2) is (2/3, 2/3)
     assert np.allclose(centroid, [2/3, 2/3])
 
+    # Negative area (clockwise)
+    poly = np.array([[0,0], [0,1], [1,1], [1,0]], dtype=float)
+    area, centroid = poly_area_centroid(poly)
+    assert np.isclose(area, 1.0)
+    assert np.allclose(centroid, [0.5, 0.5])
+
 def test_clip_polygon_halfplane():
     # Square 1x1 clipped by x < 0.5 (n=[1,0], c=0.5) -> keep x <= 0.5?
     # Function is dot(n, pt) <= c
@@ -35,6 +41,24 @@ def test_clip_polygon_halfplane():
     # Area should be 0.5
     area, center = poly_area_centroid(clipped)
     assert np.isclose(area, 0.5)
+
+    poly = np.array([
+        [-1, -1],
+        [ 1, -1],
+        [ 1,  1],
+        [-1,  1]
+    ], dtype=float)
+    # Normal=[1,0], c=2.0 (Keep x <= 2.0). Square is fully inside.
+    res = clip_polygon_halfplane(poly, n=[1, 0], c=2.0)
+    assert len(res) == 4
+
+    # Normal=[1,0], c=-2.0 (Keep x <= -2.0). Square is fully outside.
+    res = clip_polygon_halfplane(poly, n=[1, 0], c=-2.0)
+    assert len(res) == 0
+
+    # Normal=[1,0], c=1.0 (Keep x <= 1.0). Cut exactly at right edge.
+    res = clip_polygon_halfplane(poly, n=[1, 0], c=1.0)
+    assert len(res) == 4
 
 def test_compute_voronoi_centroids_bounded():
     # 1 drone in 10x10 box centered at 0

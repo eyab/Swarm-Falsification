@@ -115,7 +115,7 @@ CONFIG = {
     },
 
     "forest": {
-        "enabled": True,
+        "enabled": False,
         "seed": 7,
         "terrain": {
             "enabled": False,
@@ -140,7 +140,7 @@ CONFIG = {
 DEFAULT_DRONES = DroneModel("cf2x")
 DEFAULT_NUM_DRONES = CONFIG["num_drones"]
 DEFAULT_PHYSICS = Physics("pyb")
-DEFAULT_GUI = False
+DEFAULT_GUI = True
 
 DEFAULT_RECORD_VISION = False
 DEFAULT_PLOT = True
@@ -1287,7 +1287,482 @@ def run(
 
     env.close()
 
+# -----------------------------------------------------------------------------
+# Attacker setup and integration
+# -----------------------------------------------------------------------------
+from attacker import get_verifai, attacker_3d_mov, opt_function, distance_to_object
 
+def setup_attacker_experiments(drone=DEFAULT_DRONES,
+    num_drones=DEFAULT_NUM_DRONES,
+    physics=DEFAULT_PHYSICS,
+    gui=DEFAULT_GUI,
+    record_video=DEFAULT_RECORD_VISION,
+    plot=DEFAULT_PLOT,
+    user_debug_gui=DEFAULT_USER_DEBUG_GUI,
+    obstacles=DEFAULT_OBSTACLES,
+    simulation_freq_hz=DEFAULT_SIMULATION_FREQ_HZ,
+    control_freq_hz=DEFAULT_CONTROL_FREQ_HZ,
+    duration_sec=DEFAULT_DURATION_SEC,
+    output_folder=DEFAULT_OUTPUT_FOLDER,
+    colab=DEFAULT_COLAB,
+    fast=False,
+    render_every=10,
+    lidar_every=4,
+    camera_every=8,
+    no_sync=True,
+    safe_visuals=True):
+
+
+    rng = np.random.default_rng()
+
+    motion_cfg = CONFIG.get("motion", {})
+    goal_alpha = float(motion_cfg.get("goal_lpf_alpha", 0.88))
+    vel_alpha = float(motion_cfg.get("vel_lpf_alpha", 0.82))
+    voronoi_every = int(motion_cfg.get("voronoi_every", 2))
+
+    if not fast:
+        render_every = 1
+        lidar_every = 1
+        no_sync = False
+
+    forest_cfg = CONFIG["forest"]
+    obst_positions = precompute_obstacle_positions(AREA_X, AREA_Y, forest_cfg)
+
+    obstacle_centers_for_spawn = []
+    for k in obst_positions:
+        obstacle_centers_for_spawn += obst_positions[k]
+
+    victim_center_for_spawn = [np.array([float(VICTIM_POS[0]), float(VICTIM_POS[1])], dtype=float)]
+
+    spawn_cfg = CONFIG["spawn"]
+    obstacle_clear = float(spawn_cfg["obstacle_clearance"])
+    victim_clear = float(spawn_cfg["victim_clearance"])
+
+    
+
+    
+    # ----- Attacker Integration Loop -----
+    iteration = 0
+    # Attacker Parameter setup
+    scenario_temp = get_verifai()
+    temp_res = None
+    iteration = 0
+    min_dist_it = 0
+    best_attack = [None, None, None, None]
+    
+    while iteration < 100:
+        INIT_XYZS = np.zeros((num_drones, 3))
+        if spawn_cfg["enabled"]:
+            init_xy = sample_safe_initial_xy(
+                num_drones,
+                rng,
+                AREA_X,
+                AREA_Y,
+                spawn_cfg,
+                obstacle_centers_for_spawn,
+                obstacle_clear,
+                victim_center_for_spawn,
+                victim_clear,
+            )
+        else:
+            init_xy = np.stack(
+                [
+                    np.array(
+                        [rng.uniform(AREA_X[0] * 0.7, AREA_X[1] * 0.7), rng.uniform(AREA_Y[0] * 0.7, AREA_Y[1] * 0.7)],
+                        dtype=float,
+                    )
+                    for _ in range(num_drones)
+                ],
+                axis=0,
+            )
+
+        for j in range(num_drones):
+            INIT_XYZS[j, :] = np.array([init_xy[j, 0], init_xy[j, 1], DRONE_Z], dtype=float)
+        
+        # ---- Attacker Initial Position ----
+        attacker_init_pos = np.array([0.0, 0.0, 1.5])   
+        INIT_XYZS[0, :] = attacker_init_pos
+        INIT_RPYS = np.zeros((num_drones, 3))
+        
+        env = CtrlAviary(
+            drone_model=drone,
+            num_drones=num_drones,
+            initial_xyzs=INIT_XYZS,
+            initial_rpys=INIT_RPYS,
+            physics=physics,
+            neighbourhood_radius=10,
+            # pyb_freq=simulation_freq_hz,
+            # ctrl_freq=control_freq_hz,
+            gui=gui,
+            record=record_video,
+            obstacles=obstacles,
+            user_debug_gui=user_debug_gui,
+        )
+        # # taking out the attacker
+        # num_drones = num_drones
+        PYB_CLIENT = env.getPyBulletClient()
+
+        if gui:
+            p.addUserDebugLine([AREA_X[0], AREA_Y[0], 0.01], [AREA_X[1], AREA_Y[0], 0.01], [0, 1, 0], physicsClientId=PYB_CLIENT)
+            p.addUserDebugLine([AREA_X[1], AREA_Y[0], 0.01], [AREA_X[1], AREA_Y[1], 0.01], [0, 1, 0], physicsClientId=PYB_CLIENT)
+            p.addUserDebugLine([AREA_X[1], AREA_Y[1], 0.01], [AREA_X[0], AREA_Y[1], 0.01], [0, 1, 0], physicsClientId=PYB_CLIENT)
+            p.addUserDebugLine([AREA_X[0], AREA_Y[1], 0.01], [AREA_X[0], AREA_Y[0], 0.01], [0, 1, 0], physicsClientId=PYB_CLIENT)
+        
+        obstacle_centers = []
+        if CONFIG["forest"].get("enabled", True):
+            obstacle_centers = build_forest_scene_from_positions(
+                PYB_CLIENT, AREA_X, AREA_Y, CONFIG["forest"], obst_positions, safe_visuals=safe_visuals
+            )
+
+        victim_id = add_humanoid_victim(PYB_CLIENT, CONFIG["victim"], safe_visuals=safe_visuals)
+        victim_detect_radius = float(CONFIG["victim"].get("detect_radius_m", 0.9))
+
+        Logger(logging_freq_hz=control_freq_hz, num_drones=num_drones, output_folder=output_folder, colab=colab)
+        ctrl = [DSLPIDControl(drone_model=drone) for _ in range(num_drones)]
+
+        comm = {"victim_found": False, "rescuer_idx": None, "victim_pos_est": None}
+        support_cfg = CONFIG["support"]
+        loiter_phases = np.linspace(0.0, 2.0 * np.pi, num_drones, endpoint=False)
+
+        drone_xy = np.zeros((num_drones-1, 2))
+        prev_drone_xy = None
+        drone_vel = np.zeros((num_drones, 2))
+        action = np.zeros((num_drones, 4))
+        
+        explore_cfg = CONFIG["exploration"]
+        lidar_cfg = CONFIG["lidar"]
+        lidar_safety = CONFIG["lidar_safety"]
+        orca_cfg = CONFIG["orca"]
+        boundary_cfg = CONFIG["boundary"]
+        safety_cfg = CONFIG["safety"]
+        stab_cfg = CONFIG.get("stability", {})
+
+        dt = env.CTRL_TIMESTEP
+        exec_max_speed = MAX_STEP / max(dt, 1e-6)
+        orca_max_speed = float(orca_cfg["orca_planning_speed_mps"])
+
+        A_MAX = float(stab_cfg.get("a_max_mps2", 10.0))
+        NEAR_GROUND_Z = float(stab_cfg.get("near_ground_z", 0.35))
+        RECOVER_Z_BOOST = float(stab_cfg.get("recover_z_boost", 0.8))
+
+        START = time.time()
+        print("=== START ===")
+        print(f"fast={fast} gui={gui} safe_visuals={safe_visuals} num_drones={num_drones}")
+        print(f"CTRL dt={dt:.4f}s | MAX_STEP={MAX_STEP:.2f}m | exec_max_speed≈{exec_max_speed:.2f}m/s")
+        print(f"ORCA max_speed(planning)={orca_max_speed:.2f}m/s")
+        print(f"Accel limit A_MAX={A_MAX:.1f} m/s^2 | near_ground_z={NEAR_GROUND_Z:.2f}m")
+        print("Spawn XY:\n", INIT_XYZS[:, :2])
+        print(f"Victim: {'CAPSULE' if safe_visuals else CONFIG['victim'].get('urdf')} | detect_radius={victim_detect_radius:.2f}m")
+
+        if obstacle_centers and obstacle_centers_for_spawn:
+            a = np.array(obstacle_centers_for_spawn[:3])
+            b = np.array(obstacle_centers[:3])
+            print("Obstacle XY check (first 3) | precomputed vs built:\n", np.stack([a, b], axis=1))
+
+        lidar_hits_per_drone = [[] for _ in range(num_drones)]
+        goals_xy_filt = None
+        cmd_vel = np.zeros((num_drones, 2), dtype=float)
+        centroids_xy_cache = None
+
+        targets = np.zeros((num_drones-1, 3))
+        goals_xy = np.zeros((num_drones-1, 2))
+        pref_vels = np.zeros((num_drones-1, 2))
+        # ------ Attacker waypoints ------
+        scenes, _ = scenario_temp.generate(feedback = temp_res)
+        
+        amp = scenes.params['amp']
+        amp2 = scenes.params['amp2']
+        freq = scenes.params['freq']
+        speed = scenes.params['speed']
+        attacker_route = circular_trajectory(np.array([0,0]), 1.0, 1.0, 20)
+        attacker_wp = np.array([0, 0, 1.0])
+        curr_obj = attacker_route[0]
+        index = 0
+        temp_res = -10000
+        best_current_score = 10000
+        # -------------------------------
+        for i in range(0, int(duration_sec * env.CTRL_FREQ)):
+            obs, reward, terminated, truncated, info = env.step(action)
+            t_sim = i / env.CTRL_FREQ
+            
+            for j in range(0,num_drones-1):
+                drone_xy[j, 0] = obs[j+1][0]
+                drone_xy[j, 1] = obs[j+1][1]
+
+            if prev_drone_xy is None:
+                drone_vel[:] = 0.0
+            else:
+                drone_vel = (drone_xy - prev_drone_xy) / max(dt, 1e-6)
+            prev_drone_xy = drone_xy.copy()
+
+            if lidar_cfg["enabled"] and (i % max(1, int(lidar_every)) == 0):
+                lidar_hits_per_drone = [lidar_scan_2d(obs[j][0:3], PYB_CLIENT, lidar_cfg) for j in range(1,num_drones)]
+
+            # ---- detection ----
+            if not comm["victim_found"]:
+                for j in range(0,num_drones-1):
+                    found, vxy = victim_found_by_distance(drone_xy[j], victim_id, PYB_CLIENT, victim_detect_radius)
+                    if found:
+                        comm["victim_found"] = True
+                        comm["rescuer_idx"] = j
+                        comm["victim_pos_est"] = np.array(
+                            [vxy[0], vxy[1], float(CONFIG["rescue"]["hover_altitude"])],
+                            dtype=float,
+                        )
+                        print(f"\n*** Drone {j} FOUND HUMAN at t={t_sim:.2f}s | victim_xy={vxy} ***")
+                        break
+
+            # =========================================================
+            # (A) Voronoi / Lloyd objective
+            # =========================================================
+            if not comm["victim_found"]:
+                if (centroids_xy_cache is None) or (i % max(1, int(voronoi_every)) == 0):
+                    centroids_xy_cache = compute_voronoi_centroids_bounded(drone_xy, AREA_X, AREA_Y)
+                centroids_xy = centroids_xy_cache
+
+                for j in range(0,num_drones-1):
+                    current_xy = drone_xy[j]
+                    goal_xy = centroids_xy[j].copy()
+
+                    if np.linalg.norm(goal_xy - current_xy) < float(explore_cfg["dist_threshold"]):
+                        goal_xy = current_xy + float(explore_cfg["jitter_scale"]) * rng.standard_normal(2)
+
+                    goal_xy[0] = np.clip(goal_xy[0], AREA_X[0] + 0.3, AREA_X[1] - 0.3)
+                    goal_xy[1] = np.clip(goal_xy[1], AREA_Y[0] + 0.3, AREA_Y[1] - 0.3)
+
+                    goals_xy[j, :] = goal_xy
+            else:
+                goals_xy[:] = drone_xy[:]  # unused when victim found
+
+            # goal low-pass filter
+            if goals_xy_filt is None:
+                goals_xy_filt = goals_xy.copy()
+            else:
+                goals_xy_filt = goal_alpha * goals_xy_filt + (1.0 - goal_alpha) * goals_xy
+
+            # preferred velocity toward goals (objective only)
+            for j in range(0,num_drones-1):
+                if comm["victim_found"]:
+                    pref_vels[j] = 0.0
+                    continue
+
+                to_goal = goals_xy_filt[j] - drone_xy[j]
+                d = np.linalg.norm(to_goal)
+                if d < 1e-6:
+                    pref_vels[j] = 0.0
+                else:
+                    desired_speed = min(exec_max_speed, orca_max_speed)
+                    pref_vels[j] = (to_goal / d) * desired_speed
+
+            # =========================================================
+            # (B) Safety in velocity space
+            # =========================================================
+            if not comm["victim_found"]:
+                for j in range(num_drones-1):
+                    v_safe = np.zeros(2, dtype=float)
+
+                    v_safe += compute_lidar_avoidance_offset(
+                        drone_xy,
+                        j,
+                        lidar_hits_per_drone,
+                        influence_radius=float(lidar_cfg["influence_radius"]),
+                        gain=float(lidar_cfg["gain"]),
+                        cap=float(lidar_cfg.get("cap", 2.0)),
+                    )
+
+                    if boundary_cfg["enabled"]:
+                        v_safe += boundary_repulsion(
+                            drone_xy[j],
+                            AREA_X,
+                            AREA_Y,
+                            margin=float(boundary_cfg["margin"]),
+                            gain=float(boundary_cfg["gain"]),
+                            cap=float(boundary_cfg.get("cap", 2.0)),
+                        )
+
+                    pref_vels[j] = pref_vels[j] + v_safe
+
+            # ORCA (inter-drone)
+            safe_vels = pref_vels.copy()
+            if (not comm["victim_found"]) and orca_cfg.get("enabled", True):
+                safe_vels = orca_step_2d(
+                    positions=drone_xy,
+                    velocities=drone_vel,
+                    pref_velocities=pref_vels,
+                    agent_radius=float(orca_cfg["agent_radius"]),
+                    neighbor_dist=float(orca_cfg["neighbor_dist"]),
+                    time_horizon=float(orca_cfg["time_horizon"]),
+                    max_speed=float(orca_cfg["orca_planning_speed_mps"]),
+                    dt=dt,
+                )
+
+            # LIDAR safety brake
+            if lidar_safety.get("enabled", True):
+                d_stop = float(lidar_safety["d_stop"])
+                d_slow = float(lidar_safety["d_slow"])
+                slow_scale = float(lidar_safety["slow_scale"])
+                for j in range(num_drones-1):
+                    dmin = min_lidar_distance(drone_xy[j], lidar_hits_per_drone[j])
+                    if dmin < d_stop:
+                        safe_vels[j] *= 0.0
+                    elif dmin < d_slow:
+                        safe_vels[j] *= slow_scale
+
+            # =========================================================
+            # (C) Stability: accel limit + velocity smoothing + speed cap
+            # =========================================================
+            dv_max = A_MAX * dt
+            for j in range(num_drones-1):
+                dv = safe_vels[j] - cmd_vel[j]
+                n = np.linalg.norm(dv)
+                if n > dv_max:
+                    safe_vels[j] = cmd_vel[j] + (dv / n) * dv_max
+
+            for j in range(num_drones-1):
+                cmd_vel[j] = vel_alpha * cmd_vel[j] + (1.0 - vel_alpha) * safe_vels[j]
+                spd = np.linalg.norm(cmd_vel[j])
+                if spd > exec_max_speed:
+                    cmd_vel[j] = (cmd_vel[j] / spd) * exec_max_speed
+
+            # =========================================================
+            # (D) dt integration + tilt scaling + rescue/loiter + near-ground recovery
+            # =========================================================
+            z_boost = float(safety_cfg.get("z_boost", 0.60))
+            tilt_soft = float(safety_cfg.get("tilt_soft_rad", 0.55))
+            tilt_hard = float(safety_cfg.get("tilt_hard_rad", 0.90))
+
+            for j in range(num_drones-1):
+                roll = float(obs[j+1][3])
+                pitch = float(obs[j+1][4])
+                tilt = max(abs(roll), abs(pitch))
+                alt = float(obs[j+1][2])
+
+                if safety_cfg.get("enabled", True) and tilt >= tilt_soft:
+                    s = 1.0 - (tilt - tilt_soft) / max(tilt_hard - tilt_soft, 1e-6)
+                    s = float(np.clip(s, 0.0, 1.0))
+                    cmd_vel[j] *= s
+
+                new_xy = drone_xy[j] + cmd_vel[j] * dt
+
+                step_vec = new_xy - drone_xy[j]
+                step_len = np.linalg.norm(step_vec)
+                if step_len > MAX_STEP:
+                    new_xy = drone_xy[j] + (step_vec / step_len) * MAX_STEP
+
+                if comm["victim_found"]:
+                    if j == comm["rescuer_idx"]:
+                        z_cmd = float(CONFIG["rescue"]["hover_altitude"])
+                        comm_xy = comm["victim_pos_est"][:2].copy()
+                        new_xy = 0.90 * new_xy + 0.10 * comm_xy
+                    else:
+                        rmin = float(support_cfg["loiter_radius_min"])
+                        rmax = float(support_cfg["loiter_radius_max"])
+                        ang_spd = float(support_cfg["angular_speed"])
+                        rad = 0.5 * (rmin + rmax)
+                        ang = loiter_phases[j] + ang_spd * t_sim
+                        new_xy = comm["victim_pos_est"][:2] + np.array([rad * np.cos(ang), rad * np.sin(ang)])
+                        z_cmd = float(support_cfg["loiter_altitude"])
+                else:
+                    z_cmd = SEARCH_ALTITUDE
+
+                if safety_cfg.get("enabled", True) and tilt >= tilt_soft:
+                    z_cmd = max(z_cmd, SEARCH_ALTITUDE + z_boost)
+
+                if alt < NEAR_GROUND_Z:
+                    cmd_vel[j] *= 0.0
+                    new_xy = drone_xy[j].copy()
+                    z_cmd = max(z_cmd, SEARCH_ALTITUDE + RECOVER_Z_BOOST)
+
+                ## Altitude limits consistent with stated SAR flight envelope
+                Z_MIN = DRONE_Z   # 0.6 m (initial takeoff height)
+                Z_MAX = 3.0
+                z_cmd = float(np.clip(z_cmd, Z_MIN, Z_MAX))
+
+
+
+                targets[j, :] = np.array([new_xy[0], new_xy[1], z_cmd], dtype=float)
+
+            # Compute attacker action
+            
+            # actions [j, :], _, _ = ctrl[j].computeControl(
+            # control_timestep=env.CTRL_TIMESTEP,
+            # cur_pos=drone_state[0:3],
+            # cur_quat=drone_state[3:7],
+            # cur_vel=drone_state[10:13],
+            # cur_ang_vel=drone_state[13:16],
+            # target_pos=attacker_wp
+            # )
+            attacker_state = env._getDroneStateVector(0)
+            direction = attacker_wp - curr_obj
+            dist = np.linalg.norm(direction)
+            
+            if dist < 0.05 and index < len(attacker_route)-1:
+                index += 1
+                curr_obj = attacker_route[index]
+            elif dist < 0.05 and index == len(attacker_route)-1:
+                curr_obj = attacker_route[0]
+                index = 0
+            # attacker_wp = attacker_3d_mov(attacker_wp, curr_obj, i*dt, v_forward=amp+0.5, amp=amp, amp2=amp2, freq=freq, dt=dt)
+            attacker_wp = attacker_3d_mov(attacker_wp, curr_obj, i*dt, v_forward=speed, amp=amp, amp2=amp2, freq=freq, dt=dt)
+            # controller -> action
+            for j in range(num_drones):
+                if j == 0:
+                    action[j,:], _, _ = ctrl[j].computeControl(
+                control_timestep=dt,
+                cur_pos=attacker_state[0:3],
+                cur_quat=attacker_state[3:7],
+                cur_vel=attacker_state[10:13],
+                cur_ang_vel=attacker_state[13:16],
+                target_pos=attacker_wp
+            )
+                else:
+                    action[j, :], _, _ = ctrl[j].computeControlFromState(
+                        control_timestep=dt,
+                        state=obs[j],
+                        target_pos=targets[j-1, :],
+                        target_rpy=np.zeros(3),
+                    )
+
+            if gui and not no_sync:
+                sync(i, START, env.CTRL_TIMESTEP)
+        # ----- Stop normal loop -----
+
+            positions_voronoi = [obs[j][0:3] for j in range(1,num_drones)]
+
+            temp_score = opt_function(attacker_state[0:3], VICTIM_POS, positions_voronoi)
+
+            print("initial_max:", temp_res, " temp_score:", temp_score)    
+            temp_res = np.maximum(temp_res, temp_score)
+            min_dist_it = distance_to_object(VICTIM_POS, positions_voronoi)
+        print("Temp Result:", temp_res)
+
+        if min_dist_it > 2.0:
+            temp_res = 1
+            iteration -= 1
+            print("Invalid simulation, retrying...")
+        elif best_current_score > temp_res:
+            best_attack = [amp, amp2, freq, speed]
+            print(f"New Best Attack Found: Amp={amp}, Amp2={amp2}, Freq={freq}, Speed={speed} | Score: {temp_score}")
+            best_current_score = temp_res
+        
+
+        
+        
+        env.close()
+        iteration+= 1
+        
+        print(f"Iteration {iteration} | Current Score: {temp_score} | Best Score: {temp_res}")
+
+    print(f"=== BEST ATTACK PARAMETERS FOUND ===\nAmp={best_attack[0]}, Amp2={best_attack[1]}, Freq={best_attack[2]}, Speed={best_attack[3]} | Score: {temp_res}")
+    
+    
+def circular_trajectory(p, r, z, n_points):
+    theta = np.linspace(0, 2*np.pi, n_points, endpoint=False)
+    x = p[0] + r * np.cos(theta)
+    y = p[1] + r * np.sin(theta)
+    z_vals = np.full(n_points, z)
+
+    return np.column_stack((x, y, z_vals))
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
@@ -1325,8 +1800,28 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    run(
-        drone=args.drone,
+    # run(
+    #     drone=args.drone,
+    #     num_drones=args.num_drones,
+    #     physics=args.physics,
+    #     gui=args.gui,
+    #     record_video=args.record_video,
+    #     plot=args.plot,
+    #     user_debug_gui=args.user_debug_gui,
+    #     obstacles=args.obstacles,
+    #     simulation_freq_hz=args.simulation_freq_hz,
+    #     control_freq_hz=args.control_freq_hz,
+    #     duration_sec=args.duration_sec,
+    #     output_folder=args.output_folder,
+    #     colab=args.colab,
+    #     fast=args.fast,
+    #     render_every=args.render_every,
+    #     lidar_every=args.lidar_every,
+    #     camera_every=args.camera_every,
+    #     no_sync=args.no_sync,
+    #     safe_visuals=args.safe_visuals,
+    # )
+    setup_attacker_experiments(drone=args.drone,
         num_drones=args.num_drones,
         physics=args.physics,
         gui=args.gui,
@@ -1344,5 +1839,4 @@ if __name__ == "__main__":
         lidar_every=args.lidar_every,
         camera_every=args.camera_every,
         no_sync=args.no_sync,
-        safe_visuals=args.safe_visuals,
-    )
+        safe_visuals=args.safe_visuals,)
